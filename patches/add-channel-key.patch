@@ -1,0 +1,113 @@
+diff --git a/controller/channel.go b/controller/channel.go
+--- a/controller/channel.go
++++ b/controller/channel.go
+@@ -1124,6 +1124,98 @@
+ 	return
+ }
+ 
++type AddChannelKeyRequest struct {
++	Key string `json:"key"`
++}
++
++// AddChannelKey 仅向渠道追加密钥，不修改任何其他字段。
++// 复用 UpdateChannel 的 append+去重语义：支持换行分隔与 JSON 数组两种现有格式；
++// 渠道须为多密钥模式（ChannelInfo.IsMultiKey == true），否则报错。
++// 权限：authz.ChannelSensitiveWrite（与 PUT /api/channel/ 一致）。
++func AddChannelKey(c *gin.Context) {
++	id, err := strconv.Atoi(c.Param("id"))
++	if err != nil {
++		common.ApiError(c, err)
++		return
++	}
++	var req AddChannelKeyRequest
++	if err := c.ShouldBindJSON(&req); err != nil {
++		common.ApiError(c, err)
++		return
++	}
++	newKey := strings.TrimSpace(req.Key)
++	if newKey == "" {
++		c.JSON(http.StatusOK, gin.H{"success": false, "message": "key 不能为空"})
++		return
++	}
++
++	channel, err := model.GetChannelById(id, true)
++	if err != nil {
++		common.ApiError(c, err)
++		return
++	}
++	if channel == nil {
++		c.JSON(http.StatusOK, gin.H{"success": false, "message": "渠道不存在"})
++		return
++	}
++	if !channel.ChannelInfo.IsMultiKey {
++		c.JSON(http.StatusOK, gin.H{"success": false, "message": "该渠道不是多密钥模式，请先在编辑页开启多密钥"})
++		return
++	}
++
++	// 解析现有密钥（兼容换行分隔与 JSON 数组两种存储格式）
++	var existing []string
++	if trimmed := strings.TrimSpace(channel.Key); strings.HasPrefix(trimmed, "[") {
++		var arr []json.RawMessage
++		if err := json.Unmarshal([]byte(trimmed), &arr); err == nil {
++			for _, v := range arr {
++				existing = append(existing, string(v))
++			}
++		}
++	}
++	if len(existing) == 0 {
++		existing = strings.Split(strings.Trim(channel.Key, "\n"), "\n")
++	}
++
++	// 去重后追加新密钥
++	seen := make(map[string]struct{}, len(existing))
++	for _, k := range existing {
++		if n := strings.TrimSpace(k); n != "" {
++			seen[n] = struct{}{}
++		}
++	}
++	for _, k := range strings.Split(newKey, "\n") {
++		n := strings.TrimSpace(k)
++		if n == "" {
++			continue
++		}
++		if _, ok := seen[n]; ok {
++			continue
++		}
++		seen[n] = struct{}{}
++		existing = append(existing, n)
++	}
++
++	channel.Key = strings.Join(existing, "\n")
++	if err := channel.Update(); err != nil {
++		common.ApiError(c, err)
++		return
++	}
++	model.InitChannelCache()
++	recordManageAudit(c, "channel.add_key", map[string]interface{}{
++		"id":        channel.Id,
++		"key_count": channel.ChannelInfo.MultiKeySize,
++	})
++	c.JSON(http.StatusOK, gin.H{
++		"success": true,
++		"message": "",
++		"data": gin.H{
++			"key_count": channel.ChannelInfo.MultiKeySize,
++		},
++	})
++	return
++}
++
+ func UpdateChannelStatus(c *gin.Context) {
+ 	id, err := strconv.Atoi(c.Param("id"))
+ 	if err != nil {
+diff --git a/router/channel-router.go b/router/channel-router.go
+--- a/router/channel-router.go
++++ b/router/channel-router.go
+@@ -72,6 +72,7 @@
+ 	{method: http.MethodGet, path: "/tag/models", permission: authz.ChannelRead, handler: controller.GetTagModels},
+ 	{method: http.MethodPost, path: "/copy/:id", permission: authz.ChannelSensitiveWrite, handler: controller.CopyChannel},
+ 	{method: http.MethodPost, path: "/multi_key/manage", permission: authz.ChannelOperate, handler: controller.ManageMultiKeys},
++	{method: http.MethodPost, path: "/:id/key/add", permission: authz.ChannelSensitiveWrite, handler: controller.AddChannelKey},
+ 	{method: http.MethodPost, path: "/upstream_updates/apply", permission: authz.ChannelWrite, handler: controller.ApplyChannelUpstreamModelUpdates},
+ 	{method: http.MethodPost, path: "/upstream_updates/apply_all", permission: authz.ChannelWrite, handler: controller.ApplyAllChannelUpstreamModelUpdates},
+ 	{method: http.MethodPost, path: "/upstream_updates/detect", permission: authz.ChannelOperate, handler: controller.DetectChannelUpstreamModelUpdates},

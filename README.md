@@ -7,6 +7,7 @@
 | 补丁 | 说明 | 适用场景 |
 |------|------|----------|
 | [responses-to-chat](patches/responses-to-chat.patch) | Codex Responses API → NVIDIA Chat Completions 转换 | Codex + NVIDIA GLM |
+| [add-channel-key](patches/add-channel-key.patch) | 新增 `POST /api/channel/:id/key/add` 仅追加 key 接口 | 脚本批量为渠道追加密钥 |
 
 ## 快速开始
 
@@ -15,8 +16,9 @@
 git clone https://github.com/China-Uncle/new-api-patches.git
 cd new-api-patches
 
-# 2. 应用补丁并构建
-./scripts/apply-patch.sh v1.0.0-rc.25
+# 2. 应用补丁并构建（默认应用全部补丁，也可指定单个）
+./scripts/apply-patch.sh v1.0.0-rc.25              # 应用全部
+./scripts/apply-patch.sh v1.0.0-rc.25 add-channel-key   # 仅应用某个补丁
 
 # 3. 部署（需在目标服务器执行）
 cd /opt/new-api
@@ -59,7 +61,8 @@ git push origin patch --force
 
 ## 补丁详情
 
-详见 [docs/codex-nvidia-fix.md](docs/codex-nvidia-fix.md)
+- [docs/codex-nvidia-fix.md](docs/codex-nvidia-fix.md)
+- [docs/add-channel-key.md](docs/add-channel-key.md)
 
 ## 许可证
 
