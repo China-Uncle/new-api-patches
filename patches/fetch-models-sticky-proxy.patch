@@ -1,0 +1,553 @@
+diff --git a/common/proxy_url.go b/common/proxy_url.go
+index b295bd7..2b7eb31 100644
+--- a/common/proxy_url.go
++++ b/common/proxy_url.go
+@@ -20,8 +20,74 @@ func ParseProxyURLRuntime(rawProxyURL string) (*url.URL, bool, error) {
+ 	return parseProxyURL(rawProxyURL, true)
+ }
+ 
++// ResolveProxyURL replaces sticky proxy placeholders ({KEY}/{key}/{{KEY}}) with the given key.
++// It handles socks5h://Default.{KEY}:pass@host:port style sticky sessions where each key maps to a
++// dedicated proxy user. Key is percent-encoded for safe embedding in userinfo.
++func ResolveProxyURL(rawProxyURL string, key string) string {
++	if rawProxyURL == "" {
++		return rawProxyURL
++	}
++	key = strings.TrimSpace(key)
++	if key == "" {
++		return rawProxyURL
++	}
++	hasPlaceholder := strings.Contains(rawProxyURL, "{KEY}") || strings.Contains(rawProxyURL, "{key}") ||
++		strings.Contains(rawProxyURL, "{{KEY}}") || strings.Contains(rawProxyURL, "{{key}}") ||
++		strings.Contains(rawProxyURL, "${KEY}") || strings.Contains(rawProxyURL, "${key}")
++	if !hasPlaceholder {
++		return rawProxyURL
++	}
++	// Encode key for userinfo: QueryEscape encodes ':', '@', '/', etc; replace '+' with '%20' for userinfo.
++	encodedKey := strings.ReplaceAll(url.QueryEscape(key), "+", "%20")
++	replacements := []string{
++		"{{KEY}}", encodedKey,
++		"{{key}}", encodedKey,
++		"${KEY}", encodedKey,
++		"${key}", encodedKey,
++		"{KEY}", encodedKey,
++		"{key}", encodedKey,
++	}
++	resolved := rawProxyURL
++	for i := 0; i < len(replacements); i += 2 {
++		if strings.Contains(resolved, replacements[i]) {
++			resolved = strings.ReplaceAll(resolved, replacements[i], replacements[i+1])
++		}
++	}
++	// Re-parse to normalize and ensure url.Parse succeeds (handles any remaining edge cases).
++	if parsed, err := url.Parse(resolved); err == nil && parsed.User != nil {
++		username := parsed.User.Username()
++		if password, hasPass := parsed.User.Password(); hasPass {
++			parsed.User = url.UserPassword(username, password)
++			return parsed.String()
++		}
++		parsed.User = url.User(username)
++		return parsed.String()
++	}
++	return resolved
++}
++
++// sanitizeProxyURLLine takes the first non-empty line to be compatible with pasted multi-line proxies.
++func sanitizeProxyURLLine(raw string) string {
++	raw = strings.TrimSpace(raw)
++	if raw == "" {
++		return raw
++	}
++	if idx := strings.IndexAny(raw, "\r\n"); idx >= 0 {
++		for _, line := range strings.Split(raw, "\n") {
++			line = strings.TrimSpace(strings.Trim(line, "\r"))
++			if line != "" {
++				return line
++			}
++		}
++	}
++	if fields := strings.Fields(raw); len(fields) > 0 && len(fields[0]) != len(raw) {
++		return fields[0]
++	}
++	return raw
++}
++
+ func parseProxyURL(rawProxyURL string, allowLegacySuffix bool) (*url.URL, bool, error) {
+-	trimmedProxyURL := strings.TrimSpace(rawProxyURL)
++	trimmedProxyURL := sanitizeProxyURLLine(rawProxyURL)
+ 	if trimmedProxyURL == "" {
+ 		return nil, false, nil
+ 	}
+diff --git a/controller/channel_upstream_update.go b/controller/channel_upstream_update.go
+index e1918c2..bd1aec9 100644
+--- a/controller/channel_upstream_update.go
++++ b/controller/channel_upstream_update.go
+@@ -333,6 +333,10 @@ func sanitizeAdvancedCustomRequestError(err error, key string, requestURL string
+ }
+ 
+ func getFetchModelsResponseBody(method string, requestURL string, channel *model.Channel, headers http.Header) ([]byte, error) {
++	return getFetchModelsResponseBodyWithProxy(method, requestURL, channel, headers, channel.GetSetting().Proxy)
++}
++
++func getFetchModelsResponseBodyWithProxy(method string, requestURL string, channel *model.Channel, headers http.Header, proxyURL string) ([]byte, error) {
+ 	request, err := http.NewRequest(method, requestURL, nil)
+ 	if err != nil {
+ 		return nil, err
+@@ -345,7 +349,7 @@ func getFetchModelsResponseBody(method string, requestURL string, channel *model
+ 			request.Host = headers.Get(name)
+ 		}
+ 	}
+-	client, err := service.NewProxyHttpClient(channel.GetSetting().Proxy)
++	client, err := service.NewProxyHttpClient(proxyURL)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -360,6 +364,68 @@ func getFetchModelsResponseBody(method string, requestURL string, channel *model
+ 	return io.ReadAll(response.Body)
+ }
+ 
++// isProxyConfigError reports whether the error originates from proxy URL parsing/validation.
++func isProxyConfigError(err error) bool {
++	if err == nil {
++		return false
++	}
++	msg := err.Error()
++	return strings.Contains(msg, "proxy URL") || strings.Contains(msg, "invalid proxy") || strings.Contains(msg, "unsupported proxy")
++}
++
++func isRetryableFetchError(err error) bool {
++	if err == nil {
++		return false
++	}
++	msg := err.Error()
++	if isProxyConfigError(err) {
++		return false
++	}
++	// 401/403 auth, 429 rate-limit, 5xx transient are worth retrying with next key.
++	if strings.Contains(msg, "status code: 401") || strings.Contains(msg, "status code: 403") || strings.Contains(msg, "status code: 429") {
++		return true
++	}
++	if strings.Contains(msg, "status code: 5") {
++		// exclude 501/502 from blind retry? keep retry for transient 5xx; caller decides fallback.
++		// 500/502/503 are often transient upstream issues.
++		return true
++	}
++	return false
++}
++
++func orderedEnabledKeys(channel *model.Channel) []string {
++	keys := channel.GetKeys()
++	if len(keys) == 0 {
++		return nil
++	}
++	if !channel.ChannelInfo.IsMultiKey {
++		trimmed := strings.TrimSpace(channel.Key)
++		if trimmed != "" {
++			return []string{trimmed}
++		}
++		return keys
++	}
++	statusList := channel.ChannelInfo.MultiKeyStatusList
++	filtered := make([]string, 0, len(keys))
++	for idx, k := range keys {
++		k = strings.TrimSpace(k)
++		if k == "" {
++			continue
++		}
++		if statusList != nil {
++			if st, ok := statusList[idx]; ok && st != common.ChannelStatusEnabled {
++				continue
++			}
++		}
++		filtered = append(filtered, k)
++	}
++	return filtered
++}
++
++func resolveProxyForKey(rawProxy string, key string) string {
++	return common.ResolveProxyURL(rawProxy, key)
++}
++
+ func fetchChannelUpstreamModelIDs(channel *model.Channel) ([]string, error) {
+ 	baseURL := constant.ChannelBaseURLs[channel.Type]
+ 	if channel.GetBaseURL() != "" {
+@@ -367,27 +433,98 @@ func fetchChannelUpstreamModelIDs(channel *model.Channel) ([]string, error) {
+ 	}
+ 
+ 	if channel.Type == constant.ChannelTypeOllama {
+-		key := strings.TrimSpace(strings.Split(channel.Key, "\n")[0])
+-		models, err := ollama.FetchOllamaModels(baseURL, key)
+-		if err != nil {
+-			return nil, err
++		keys := orderedEnabledKeys(channel)
++		if len(keys) == 0 {
++			keys = []string{strings.TrimSpace(strings.Split(channel.Key, "\n")[0])}
++		}
++		var lastErr error
++		for _, k := range keys {
++			k = strings.TrimSpace(k)
++			if k == "" {
++				continue
++			}
++			models, err := ollama.FetchOllamaModels(baseURL, k)
++			if err == nil {
++				return normalizeModelNames(lo.Map(models, func(item ollama.OllamaModel, _ int) string {
++					return item.Name
++				})), nil
++			}
++			lastErr = sanitizeFetchModelsError(err, k)
++			if !isRetryableFetchError(err) && !isProxyConfigError(err) {
++				// non-retryable but try next key for robustness
++			}
++		}
++		if lastErr != nil {
++			return nil, lastErr
+ 		}
+-		return normalizeModelNames(lo.Map(models, func(item ollama.OllamaModel, _ int) string {
+-			return item.Name
+-		})), nil
++		return nil, fmt.Errorf("获取渠道密钥失败: no enabled keys")
+ 	}
+ 
+ 	if channel.Type == constant.ChannelTypeGemini {
+-		key, _, apiErr := channel.GetNextEnabledKey()
+-		if apiErr != nil {
+-			return nil, fmt.Errorf("获取渠道密钥失败: %w", apiErr)
++		rawProxy := channel.GetSetting().Proxy
++		ordered := orderedEnabledKeys(channel)
++		if len(ordered) == 0 {
++			return nil, fmt.Errorf("获取渠道密钥失败: no enabled keys")
+ 		}
+-		key = strings.TrimSpace(key)
+-		models, err := gemini.FetchGeminiModels(baseURL, key, channel.GetSetting().Proxy)
+-		if err != nil {
+-			return nil, err
++		// Strategy C: first try GetNextEnabledKey (Random/Polling), then sequential remaining, finally direct fallback
++		var tryOrder []string
++		if channel.ChannelInfo.IsMultiKey {
++			if fk, _, apiErr := channel.GetNextEnabledKey(); apiErr == nil {
++				fk = strings.TrimSpace(fk)
++				if fk != "" {
++					tryOrder = append(tryOrder, fk)
++				}
++			}
++			seen := make(map[string]struct{}, len(tryOrder))
++			for _, k := range tryOrder {
++				seen[k] = struct{}{}
++			}
++			for _, k := range ordered {
++				if _, ok := seen[k]; !ok {
++					tryOrder = append(tryOrder, k)
++				}
++			}
++		} else {
++			tryOrder = ordered
++		}
++		var lastErr error
++		for _, k := range tryOrder {
++			k = strings.TrimSpace(k)
++			if k == "" {
++				continue
++			}
++			resolvedProxy := resolveProxyForKey(rawProxy, k)
++			models, err := gemini.FetchGeminiModels(baseURL, k, resolvedProxy)
++			if err == nil {
++				return normalizeModelNames(models), nil
++			}
++			lastErr = sanitizeFetchModelsError(err, k)
++			if isProxyConfigError(err) {
++				break
++			}
++			if !isRetryableFetchError(err) {
++				// non-retryable error, but still try next key to maximize success chance
++			}
++		}
++		// direct fallback
++		if strings.TrimSpace(rawProxy) != "" && lastErr != nil {
++			for _, k := range ordered {
++				k = strings.TrimSpace(k)
++				if k == "" {
++					continue
++				}
++				models, err := gemini.FetchGeminiModels(baseURL, k, "")
++				if err == nil {
++					common.SysLog(fmt.Sprintf("fetchChannelUpstreamModelIDs: Gemini proxy fallback to direct succeeded channel_id=%d", channel.Id))
++					return normalizeModelNames(models), nil
++				}
++				lastErr = sanitizeFetchModelsError(err, k)
++			}
++		}
++		if lastErr != nil {
++			return nil, lastErr
+ 		}
+-		return normalizeModelNames(models), nil
++		return nil, fmt.Errorf("获取模型列表失败: all keys exhausted")
+ 	}
+ 
+ 	if channel.Type == constant.ChannelTypeAdvancedCustom {
+@@ -424,68 +561,214 @@ func fetchChannelUpstreamModelIDs(channel *model.Channel) ([]string, error) {
+ 		url = fmt.Sprintf("%s/v1/models", baseURL)
+ 	}
+ 
+-	key, _, apiErr := channel.GetNextEnabledKey()
+-	if apiErr != nil {
+-		return nil, fmt.Errorf("获取渠道密钥失败: %w", apiErr)
++	rawProxy := channel.GetSetting().Proxy
++	ordered := orderedEnabledKeys(channel)
++	if len(ordered) == 0 {
++		return nil, fmt.Errorf("获取渠道密钥失败: no enabled keys")
+ 	}
+-	key = strings.TrimSpace(key)
+-
+-	headers, err := buildFetchModelsHeaders(channel, key)
+-	if err != nil {
+-		return nil, sanitizeFetchModelsError(err, key)
+-	}
+-
+-	body, err := getFetchModelsResponseBody(http.MethodGet, url, channel, headers)
+-	if err != nil {
+-		return nil, sanitizeAdvancedCustomRequestError(err, key, url)
++	var tryOrder []string
++	if channel.ChannelInfo.IsMultiKey {
++		if fk, _, apiErr := channel.GetNextEnabledKey(); apiErr == nil {
++			fk = strings.TrimSpace(fk)
++			if fk != "" {
++				tryOrder = append(tryOrder, fk)
++			}
++		}
++		seen := make(map[string]struct{}, len(tryOrder))
++		for _, k := range tryOrder {
++			seen[k] = struct{}{}
++		}
++		for _, k := range ordered {
++			if _, ok := seen[k]; !ok {
++				tryOrder = append(tryOrder, k)
++			}
++		}
++	} else {
++		tryOrder = ordered
+ 	}
+-
+-	var result OpenAIModelsResponse
+-	if err := common.Unmarshal(body, &result); err != nil {
+-		return nil, err
++	var lastErr error
++	var lastKey string
++	for _, k := range tryOrder {
++		k = strings.TrimSpace(k)
++		if k == "" {
++			continue
++		}
++		lastKey = k
++		headers, err := buildFetchModelsHeaders(channel, k)
++		if err != nil {
++			lastErr = sanitizeFetchModelsError(err, k)
++			continue
++		}
++		resolvedProxy := resolveProxyForKey(rawProxy, k)
++		body, err := getFetchModelsResponseBodyWithProxy(http.MethodGet, url, channel, headers, resolvedProxy)
++		if err != nil {
++			lastErr = sanitizeAdvancedCustomRequestError(err, k, url)
++			if isProxyConfigError(err) {
++				break
++			}
++			if isRetryableFetchError(err) {
++				continue
++			}
++			// for openai, also try next key on any error to maximize discovery
++			continue
++		}
++		var result OpenAIModelsResponse
++		if err := common.Unmarshal(body, &result); err != nil {
++			lastErr = sanitizeFetchModelsError(err, k)
++			continue
++		}
++		ids := lo.Map(result.Data, func(item OpenAIModel, _ int) string {
++			if channel.Type == constant.ChannelTypeGemini {
++				return strings.TrimPrefix(item.ID, "models/")
++			}
++			return item.ID
++		})
++		return normalizeModelNames(ids), nil
+ 	}
+-	ids := lo.Map(result.Data, func(item OpenAIModel, _ int) string {
+-		if channel.Type == constant.ChannelTypeGemini {
+-			return strings.TrimPrefix(item.ID, "models/")
++	// direct fallback: retry all keys without proxy
++	if strings.TrimSpace(rawProxy) != "" && lastErr != nil {
++		for _, k := range ordered {
++			k = strings.TrimSpace(k)
++			if k == "" {
++				continue
++			}
++			headers, err := buildFetchModelsHeaders(channel, k)
++			if err != nil {
++				lastErr = sanitizeFetchModelsError(err, k)
++				continue
++			}
++			body, err := getFetchModelsResponseBodyWithProxy(http.MethodGet, url, channel, headers, "")
++			if err != nil {
++				lastErr = sanitizeAdvancedCustomRequestError(err, k, url)
++				continue
++			}
++			var result OpenAIModelsResponse
++			if err := common.Unmarshal(body, &result); err != nil {
++				lastErr = sanitizeFetchModelsError(err, k)
++				continue
++			}
++			common.SysLog(fmt.Sprintf("fetchChannelUpstreamModelIDs: proxy fallback to direct succeeded channel_id=%d key_index fallback", channel.Id))
++			ids := lo.Map(result.Data, func(item OpenAIModel, _ int) string {
++				return item.ID
++			})
++			return normalizeModelNames(ids), nil
+ 		}
+-		return item.ID
+-	})
+-	return normalizeModelNames(ids), nil
++	}
++	if lastErr != nil {
++		_ = lastKey
++		return nil, lastErr
++	}
++	return nil, fmt.Errorf("获取模型列表失败: all keys exhausted")
+ }
+ 
+ func fetchAdvancedCustomUpstreamModelIDs(channel *model.Channel, baseURL string) ([]string, error) {
+-	key, _, apiErr := channel.GetNextEnabledKey()
+-	if apiErr != nil {
+-		return nil, fmt.Errorf("获取渠道密钥失败: %w", apiErr)
+-	}
+-	key = strings.TrimSpace(key)
+-
+-	info := &relaycommon.RelayInfo{
+-		RelayFormat:    types.RelayFormatOpenAI,
+-		RelayMode:      relayconstant.RelayModeUnknown,
+-		RequestURLPath: dto.AdvancedCustomModelListPath,
+-		ChannelMeta: &relaycommon.ChannelMeta{
+-			ChannelType:          constant.ChannelTypeAdvancedCustom,
+-			ChannelBaseUrl:       baseURL,
+-			ApiKey:               key,
+-			ChannelOtherSettings: channel.GetOtherSettings(),
+-		},
++	rawProxy := channel.GetSetting().Proxy
++	ordered := orderedEnabledKeys(channel)
++	if len(ordered) == 0 {
++		return nil, fmt.Errorf("获取渠道密钥失败: no enabled keys")
++	}
++	var tryOrder []string
++	if channel.ChannelInfo.IsMultiKey {
++		if fk, _, apiErr := channel.GetNextEnabledKey(); apiErr == nil {
++			fk = strings.TrimSpace(fk)
++			if fk != "" {
++				tryOrder = append(tryOrder, fk)
++			}
++		}
++		seen := make(map[string]struct{}, len(tryOrder))
++		for _, k := range tryOrder {
++			seen[k] = struct{}{}
++		}
++		for _, k := range ordered {
++			if _, ok := seen[k]; !ok {
++				tryOrder = append(tryOrder, k)
++			}
++		}
++	} else {
++		tryOrder = ordered
+ 	}
+-
+-	adaptor := &advancedcustom.Adaptor{}
+-	url, headers, err := adaptor.BuildModelListRequest(info)
+-	if err != nil {
+-		return nil, sanitizeFetchModelsError(err, key)
++	var lastErr error
++	for _, k := range tryOrder {
++		k = strings.TrimSpace(k)
++		if k == "" {
++			continue
++		}
++		info := &relaycommon.RelayInfo{
++			RelayFormat:    types.RelayFormatOpenAI,
++			RelayMode:      relayconstant.RelayModeUnknown,
++			RequestURLPath: dto.AdvancedCustomModelListPath,
++			ChannelMeta: &relaycommon.ChannelMeta{
++				ChannelType:          constant.ChannelTypeAdvancedCustom,
++				ChannelBaseUrl:       baseURL,
++				ApiKey:               k,
++				ChannelOtherSettings: channel.GetOtherSettings(),
++			},
++		}
++		adaptor := &advancedcustom.Adaptor{}
++		url, headers, err := adaptor.BuildModelListRequest(info)
++		if err != nil {
++			lastErr = sanitizeFetchModelsError(err, k)
++			continue
++		}
++		if err := applyFetchModelsHeaderOverrides(channel, k, headers); err != nil {
++			lastErr = sanitizeFetchModelsError(err, k)
++			continue
++		}
++		resolvedProxy := resolveProxyForKey(rawProxy, k)
++		body, err := getFetchModelsResponseBodyWithProxy(http.MethodGet, url, channel, headers, resolvedProxy)
++		if err != nil {
++			lastErr = sanitizeFetchModelsError(err, k)
++			if isProxyConfigError(err) {
++				break
++			}
++			if isRetryableFetchError(err) {
++				continue
++			}
++			continue
++		}
++		return parseOpenAIModelIDs(body)
+ 	}
+-	if err := applyFetchModelsHeaderOverrides(channel, key, headers); err != nil {
+-		return nil, sanitizeFetchModelsError(err, key)
++	// direct fallback
++	if strings.TrimSpace(rawProxy) != "" && lastErr != nil {
++		for _, k := range ordered {
++			k = strings.TrimSpace(k)
++			if k == "" {
++				continue
++			}
++			info := &relaycommon.RelayInfo{
++				RelayFormat:    types.RelayFormatOpenAI,
++				RelayMode:      relayconstant.RelayModeUnknown,
++				RequestURLPath: dto.AdvancedCustomModelListPath,
++				ChannelMeta: &relaycommon.ChannelMeta{
++					ChannelType:          constant.ChannelTypeAdvancedCustom,
++					ChannelBaseUrl:       baseURL,
++					ApiKey:               k,
++					ChannelOtherSettings: channel.GetOtherSettings(),
++				},
++			}
++			adaptor := &advancedcustom.Adaptor{}
++			url, headers, err := adaptor.BuildModelListRequest(info)
++			if err != nil {
++				lastErr = sanitizeFetchModelsError(err, k)
++				continue
++			}
++			if err := applyFetchModelsHeaderOverrides(channel, k, headers); err != nil {
++				lastErr = sanitizeFetchModelsError(err, k)
++				continue
++			}
++			body, err := getFetchModelsResponseBodyWithProxy(http.MethodGet, url, channel, headers, "")
++			if err != nil {
++				lastErr = sanitizeFetchModelsError(err, k)
++				continue
++			}
++			common.SysLog(fmt.Sprintf("fetchAdvancedCustomUpstreamModelIDs: proxy fallback to direct succeeded channel_id=%d", channel.Id))
++			return parseOpenAIModelIDs(body)
++		}
+ 	}
+-
+-	body, err := getFetchModelsResponseBody(http.MethodGet, url, channel, headers)
+-	if err != nil {
+-		return nil, sanitizeFetchModelsError(err, key)
++	if lastErr != nil {
++		return nil, lastErr
+ 	}
+-	return parseOpenAIModelIDs(body)
++	return nil, fmt.Errorf("获取模型列表失败: all keys exhausted")
+ }
+ 
+ func updateChannelUpstreamModelSettings(channel *model.Channel, settings dto.ChannelOtherSettings, updateModels bool) error {

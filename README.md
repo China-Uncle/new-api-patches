@@ -8,6 +8,7 @@
 |------|------|----------|
 | [responses-to-chat](patches/responses-to-chat.patch) | Codex Responses API → NVIDIA Chat Completions 转换 | Codex + NVIDIA GLM |
 | [add-channel-key](patches/add-channel-key.patch) | 新增 `POST /api/channel/:id/key/add` 仅追加 key 接口 | 脚本批量为渠道追加密钥 |
+| [fetch-models-sticky-proxy](patches/fetch-models-sticky-proxy.patch) | 修复多密钥+粘性代理获取模型 `invalid proxy URL`，支持 `{KEY}` 占位符与全量重试 | 多密钥粘性代理渠道 |
 
 ## 快速开始
 
@@ -63,6 +64,7 @@ git push origin patch --force
 
 - [docs/codex-nvidia-fix.md](docs/codex-nvidia-fix.md)
 - [docs/add-channel-key.md](docs/add-channel-key.md)
+- [docs/fetch-models-sticky-proxy.md](docs/fetch-models-sticky-proxy.md)
 
 ## 许可证
 
