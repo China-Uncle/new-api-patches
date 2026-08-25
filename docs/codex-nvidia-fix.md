@@ -47,7 +47,7 @@ docker build -t new-api:patched .
 # 直接从本仓库 patch 分支 cherry-pick
 git remote add patches https://github.com/China-Uncle/new-api-patches.git
 git fetch patches patch
-git cherry-pisk patches/patch
+git cherry-pick patches/patch
 ```
 
 ## 配套数据库配置
