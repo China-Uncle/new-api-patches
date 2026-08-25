@@ -1,0 +1,88 @@
+name: Sync Upstream & Rebase Patch
+
+on:
+  schedule:
+    - cron: '0 0 * * 1'  # 每周一 UTC 00:00
+  workflow_dispatch:      # 手动触发
+
+jobs:
+  sync-and-rebase:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/QuantumNous/new-api.git || true
+          git fetch upstream main
+          echo "Latest upstream: $(git log --oneline -1 upstream/main)"
+
+      - name: Sync main with upstream
+        run: |
+          git checkout main
+          git reset --hard upstream/main
+          git push origin main --force
+          echo "✅ main synced with upstream"
+
+      - name: Checkout patch branch
+        run: |
+          git checkout patch || git checkout -b patch origin/patch
+
+      - name: Rebase patch onto updated main
+        id: rebase
+        run: |
+          git rebase origin/main
+          echo "rebase_success=true" >> $GITHUB_OUTPUT
+        continue-on-error: true
+
+      - name: Push rebased patch (success)
+        if: steps.rebase.outcome == 'success'
+        run: |
+          git push origin patch --force
+          echo "✅ Patch branch rebased successfully"
+
+      - name: Create issue on conflict (failure)
+        if: steps.rebase.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const rebaseLog = `
+            ## ⚠️ Auto-Rebase Conflict Detected
+
+            **Time**: ${new Date().toISOString()}
+            **Upstream commit**: ${(await github.rest.repos.getCommit({
+              owner: 'QuantumNous',
+              repo: 'new-api',
+              ref: 'main'
+            })).data.sha.substring(0, 7)}
+
+            ### Conflict occurred during automatic rebase of \`patch\` branch onto \`origin/main\`.
+
+            **Manual resolution required:**
+
+            \`\`\`bash
+            cd new-api-patches
+            git checkout patch
+            git fetch upstream main
+            git rebase upstream/main
+            # Fix conflicts in: relaykit/relayconvert/internal/oai_responses/to_oai_chat_req.go
+            git add .
+            git rebase --continue
+            git push origin patch --force
+            \`\`\`
+
+            See [rebase documentation](https://github.com/China-Uncle/new-api-patches/blob/main/docs/codex-nvidia-fix.md) for details.
+            `;
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '⚠️ Auto-rebase conflict with upstream',
+              body: rebaseLog,
+              labels: ['conflict', 'auto-detected']
+            });

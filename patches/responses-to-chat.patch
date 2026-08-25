@@ -1,0 +1,99 @@
+diff --git a/relaykit/relayconvert/internal/oai_responses/to_oai_chat_req.go b/relaykit/relayconvert/internal/oai_responses/to_oai_chat_req.go
+index 6966095..6c6495a 100644
+--- a/relaykit/relayconvert/internal/oai_responses/to_oai_chat_req.go
++++ b/relaykit/relayconvert/internal/oai_responses/to_oai_chat_req.go
+@@ -97,12 +97,8 @@ func ResponsesRequestToChatCompletionsRequest(req *dto.OpenAIResponsesRequest) (
+ 			out.ParallelTooCalls = &parallelToolCalls
+ 		}
+ 	}
+-	if len(req.PromptCacheKey) > 0 && kitutil.GetJsonType(req.PromptCacheKey) == "string" {
+-		var promptCacheKey string
+-		if err := kitutil.Unmarshal(req.PromptCacheKey, &promptCacheKey); err == nil {
+-			out.PromptCacheKey = promptCacheKey
+-		}
+-	}
++	// prompt_cache_key is an OpenAI Responses-only optimization field that
++	// strict upstreams (e.g. NVIDIA) reject; drop it during conversion.
+ 
+ 	return out, nil
+ }
+@@ -342,25 +338,40 @@ func responsesRequestToolsToChat(raw json.RawMessage) ([]dto.ToolCallRequest, er
+ 	for _, tool := range tools {
+ 		toolType := strings.TrimSpace(kitutil.Interface2String(tool["type"]))
+ 		if toolType == "function" {
++			fn := map[string]any{}
++			if f, ok := tool["function"].(map[string]any); ok {
++				fn = f
++			}
++			name := strings.TrimSpace(kitutil.Interface2String(firstNonEmpty(
++				tool["name"], fn["name"],
++			)))
++			if name == "" {
++				name = strings.TrimSpace(kitutil.Interface2String(tool["name"]))
++			}
++			description := kitutil.Interface2String(firstNonEmpty(
++				tool["description"], fn["description"],
++			))
++			var parameters any
++			if p, ok := fn["parameters"]; ok {
++				parameters = p
++			} else if p, ok := tool["parameters"]; ok {
++				parameters = p
++			}
+ 			out = append(out, dto.ToolCallRequest{
+ 				Type: "function",
+ 				Function: dto.FunctionRequest{
+-					Name:        strings.TrimSpace(kitutil.Interface2String(tool["name"])),
+-					Description: kitutil.Interface2String(tool["description"]),
+-					Parameters:  tool["parameters"],
++					Name:        name,
++					Description: description,
++					Parameters:  parameters,
+ 				},
+ 			})
+ 			continue
+ 		}
+ 
+-		rawTool, err := kitutil.Marshal(tool)
+-		if err != nil {
+-			return nil, err
+-		}
+-		out = append(out, dto.ToolCallRequest{
+-			Type:   toolType,
+-			Custom: rawTool,
+-		})
++		// Strict upstreams (e.g. NVIDIA) only accept "function" tools.
++		// Non-function tools (e.g. Codex "namespace" tools) are skipped to
++		// avoid upstream serde rejection of the whole request body.
++		continue
+ 	}
+ 	return out, nil
+ }
+@@ -392,7 +403,9 @@ func responsesRequestToolChoiceToChat(raw json.RawMessage) (any, error) {
+ 			}, nil
+ 		}
+ 	}
+-	return choice, nil
++	// Non-function tool_choice (e.g. a namespace tool) cannot be honored by
++	// strict upstreams that only accept "function" tools; fall back to auto.
++	return "auto", nil
+ }
+ 
+ func RequestToolChoiceToChat(raw json.RawMessage) (any, error) {
+@@ -572,3 +585,16 @@ func JSONString(raw json.RawMessage) (string, error) {
+ func RawJSONPresent(raw json.RawMessage) bool {
+ 	return rawJSONPresent(raw)
+ }
++
++// firstNonEmpty returns the first non-empty string among candidates.
++func firstNonEmpty(values ...any) string {
++	for _, v := range values {
++		if v == nil {
++			continue
++		}
++		if s := strings.TrimSpace(kitutil.Interface2String(v)); s != "" {
++			return s
++		}
++	}
++	return ""
++}
